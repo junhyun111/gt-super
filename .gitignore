@@ -1,4 +1,28 @@
-.venv
-cache
-data
-outputs
+# Python environments and bytecode
+.venv/
+__pycache__/
+*.py[cod]
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter temporary files
+.ipynb_checkpoints/
+
+# Downloaded datasets and model caches
+data/
+cache/
+
+# Training outputs and checkpoints
+outputs/
+*.pt
+*.pth
+*.ckpt
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
