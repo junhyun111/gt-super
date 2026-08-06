@@ -31,7 +31,7 @@ class ExperimentConfig:
     smoke_train_images: int = 300
     smoke_val_images: int = 100
     smoke_epochs: int = 3
-    full_epochs: int = 10
+    full_epochs: int = 7
     batch_size: int | None = None
     num_workers: int = 0
     image_min_size_smoke: int = 384
