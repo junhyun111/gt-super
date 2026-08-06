@@ -78,7 +78,10 @@ class ExperimentConfig:
 
     @property
     def checkpoint_dir(self) -> Path:
-        path = self.output_dir / "checkpoints"
+        # Keep epoch checkpoints in the project cache so training artifacts are
+        # available immediately after every epoch without mixing them with
+        # result CSVs and plots under ``outputs``.
+        path = self.root / "cache" / "checkpoints"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
