@@ -11,6 +11,7 @@ import torch
 from PIL import Image, ImageDraw
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from .config import ID2LABEL, ExperimentConfig
 from .data import DataBundle, VOCDataset, collate_detection_batch, make_loaders
@@ -23,7 +24,12 @@ def evaluate_main(model, val_loader, processor, config: ExperimentConfig):
     metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox")
     calls_before = model.aux_forward_calls
     start = time.perf_counter()
-    for batch in val_loader:
+    for batch in tqdm(
+        val_loader,
+        desc="main-only validation",
+        leave=False,
+        mininterval=0.5,
+    ):
         pixel_values = batch["pixel_values"].to(config.device, non_blocking=True)
         pixel_mask = batch["pixel_mask"].to(config.device, non_blocking=True)
         result = model(pixel_values=pixel_values, pixel_mask=pixel_mask, labels=None)

@@ -105,7 +105,10 @@ def train_one_experiment(
     history, gradient_history = [], []
     elapsed_train = 0.0
 
+    print(f"[phase] initial main-only validation: {len(val_loader)} batches")
     initial_metrics = evaluate_main(model, val_loader, bundle.processor, config)
+    print(f"[phase] initial validation complete: mAP={initial_metrics['map']:.4f}, "
+          f"AP@0.5={initial_metrics['map50']:.4f}")
     history.append({
         "experiment": experiment, "seed": seed, "epoch": 0,
         "model_fingerprint": fingerprint, "train_seconds": 0.0,
@@ -116,6 +119,7 @@ def train_one_experiment(
     })
 
     for epoch in range(1, config.epochs + 1):
+        print(f"[phase] training epoch {epoch}/{config.epochs}: {len(train_loader)} batches")
         model.train()
         sums = Counter()
         total_objects = used_objects = collision_targets = 0
@@ -169,6 +173,7 @@ def train_one_experiment(
 
         scheduler.step()
         elapsed_train += time.perf_counter() - epoch_start
+        print(f"[phase] validating epoch {epoch}/{config.epochs}: {len(val_loader)} batches")
         metrics = evaluate_main(model, val_loader, bundle.processor, config)
         batches = max(sums["batches"], 1)
         aux_batches = max(sums["aux_batches"], 1)
