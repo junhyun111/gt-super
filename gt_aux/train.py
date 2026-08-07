@@ -30,6 +30,16 @@ def move_labels_to_device(labels, device):
 def auxiliary_weight(experiment: str, progress: float, total_epochs: int, base_weight: float) -> float:
     if experiment == "baseline":
         return 0.0
+    if experiment == "shared_late_decay":
+        # Keep full auxiliary supervision through the early/middle phase, then
+        # reduce its magnitude when the main and auxiliary objectives may begin
+        # to conflict. With 7 epochs this is 0.5 (e1-e5), 0.25 (e6), 0.05 (e7).
+        epoch = min(int(progress) + 1, total_epochs)
+        if epoch <= max(total_epochs - 2, 1):
+            return base_weight
+        if epoch == max(total_epochs - 1, 1):
+            return base_weight * 0.5
+        return base_weight * 0.1
     if experiment != "shared_decay":
         return base_weight
     warmup_end, hold_end = 0.5, 2.0

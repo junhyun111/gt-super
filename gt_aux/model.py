@@ -97,7 +97,7 @@ def assert_hf_bbox_heads_are_tied(detector):
 class GTDeformableDetr(nn.Module):
     VALID_MODES = {
         "baseline", "separate", "shared_detach", "shared_e2e",
-        "shared_decay", "random_patch", "no_adapter",
+        "shared_decay", "shared_late_decay", "random_patch", "no_adapter",
     }
 
     def __init__(self, detector, mode: str, feature_level: int = 0):
