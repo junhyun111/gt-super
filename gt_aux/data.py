@@ -52,22 +52,31 @@ def parse_voc_record(config: ExperimentConfig, image_id: str) -> dict:
 
 
 def prepare_data(config: ExperimentConfig) -> DataBundle:
-    assert (config.voc_root / "JPEGImages").exists(), f"Missing {config.voc_root / 'JPEGImages'}"
-    assert (config.voc_root / "Annotations").exists(), f"Missing {config.voc_root / 'Annotations'}"
+    images_dir = config.voc_root / "JPEGImages"
+    annotations_dir = config.voc_root / "Annotations"
+    if not images_dir.exists():
+        raise FileNotFoundError(f"Missing {images_dir}")
+    if not annotations_dir.exists():
+        raise FileNotFoundError(f"Missing {annotations_dir}")
     trainval_file = config.voc_root / "ImageSets" / "Main" / "trainval.txt"
     all_ids = [line.strip() for line in trainval_file.read_text().splitlines() if line.strip()]
-    assert len(all_ids) == 5011, f"Expected 5011 VOC trainval images, got {len(all_ids)}"
+    if len(all_ids) != 5011:
+        raise ValueError(f"Expected 5011 VOC trainval images, got {len(all_ids)}")
 
-    selection_rng = np.random.default_rng(config.seed)
+    selection_rng = np.random.default_rng(config.data_seed)
     selected_ids = selection_rng.permutation(all_ids)[:config.full_train_images + config.full_val_images]
     records = [
         parse_voc_record(config, str(image_id))
         for image_id in tqdm(selected_ids, desc="VOC XML")
     ]
     records = [record for record in records if record["boxes_xyxy"]]
-    assert len(records) == config.full_train_images + config.full_val_images
+    expected_records = config.full_train_images + config.full_val_images
+    if len(records) != expected_records:
+        raise ValueError(
+            f"Expected {expected_records} annotated records, got {len(records)}"
+        )
 
-    split_rng = np.random.default_rng(config.seed + 1)
+    split_rng = np.random.default_rng(config.data_seed + 1)
     order = split_rng.permutation(len(records))
     full_train_records = [records[index] for index in order[:config.full_train_images]]
     full_val_records = [
@@ -76,11 +85,19 @@ def prepare_data(config: ExperimentConfig) -> DataBundle:
     ]
     train_object_count = sum(len(record["boxes_xyxy"]) for record in full_train_records)
     val_object_count = sum(len(record["boxes_xyxy"]) for record in full_val_records)
-    assert (train_object_count, val_object_count) == (9180, 2530)
+    if train_object_count <= 0 or val_object_count <= 0:
+        raise ValueError("Train/validation split must contain annotated objects")
+    train_ids = {record["image_id"] for record in full_train_records}
+    val_ids = {record["image_id"] for record in full_val_records}
+    if train_ids.intersection(val_ids):
+        raise RuntimeError("Data leakage detected: train and validation IDs overlap")
 
     manifest = {
-        "seed": config.seed, "selection_seed": config.seed,
-        "split_seed": config.seed + 1,
+        "data_seed": config.data_seed,
+        "selection_seed": config.data_seed,
+        "split_seed": config.data_seed + 1,
+        "train_object_count": train_object_count,
+        "val_object_count": val_object_count,
         "full_train_ids": [record["image_id"] for record in full_train_records],
         "full_val_ids": [record["image_id"] for record in full_val_records],
     }

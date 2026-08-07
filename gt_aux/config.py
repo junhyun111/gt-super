@@ -26,6 +26,7 @@ class ExperimentConfig:
     run_mode: str = "smoke"
     checkpoint: str = "SenseTime/deformable-detr"
     seed: int = 42
+    data_seed: int = 42
     full_train_images: int = 3000
     full_val_images: int = 750
     smoke_train_images: int = 400
@@ -47,6 +48,7 @@ class ExperimentConfig:
     horizontal_flip_p: float = 0.5
     use_amp: bool | None = None
     disable_custom_kernels: bool | None = None
+    deterministic: bool = True
     save_epoch_checkpoints: bool = False
     experiments: list[str] = field(default_factory=lambda: [
         "baseline", "shared_detach", "shared_e2e",
@@ -113,6 +115,12 @@ class ExperimentConfig:
             raise ValueError("base_aux_weight must be non-negative")
         if self.num_workers < 0:
             raise ValueError("num_workers must be non-negative")
+        if self.train_images > self.full_train_images:
+            raise ValueError("train_images must not exceed full_train_images")
+        if self.val_images > self.full_val_images:
+            raise ValueError("val_images must not exceed full_val_images")
+        if self.weight_decay < 0:
+            raise ValueError("weight_decay must be non-negative")
 
     @property
     def data_dir(self) -> Path:
@@ -184,18 +192,23 @@ class ExperimentConfig:
             "feature_level": self.feature_level,
             "horizontal_flip_p": self.horizontal_flip_p,
             "use_amp": self.use_amp,
+            "deterministic": self.deterministic,
             "save_epoch_checkpoints": self.save_epoch_checkpoints,
             "device": str(self.device), "experiments": list(self.experiments),
-            "seed": self.seed,
+            "seed": self.seed, "data_seed": self.data_seed,
         }
 
 
-def seed_everything(seed: int) -> None:
+def seed_everything(seed: int, deterministic: bool | None = None) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if deterministic is not None:
+        torch.backends.cudnn.benchmark = not deterministic
+        torch.backends.cudnn.deterministic = deterministic
+        torch.use_deterministic_algorithms(deterministic, warn_only=True)
 
 
 def model_fingerprint(model: torch.nn.Module) -> str:

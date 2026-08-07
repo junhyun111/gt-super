@@ -20,7 +20,7 @@ from .model import GTDeformableDetr, make_model
 
 
 GRADIENT_COLUMNS = [
-    "experiment", "seed", "epoch", "cosine", "main_grad_norm",
+    "experiment", "seed", "data_seed", "epoch", "cosine", "main_grad_norm",
     "weighted_aux_grad_norm", "norm_ratio",
 ]
 
@@ -120,7 +120,7 @@ def _save_checkpoint(
 
 def _load_resume_checkpoint(
     resume_from, model, optimizer, scheduler, scaler, train_loader,
-    experiment, seed,
+    config, experiment, seed,
 ):
     path = Path(resume_from).expanduser().resolve()
     if not path.exists():
@@ -143,6 +143,26 @@ def _load_resume_checkpoint(
         )
     if int(checkpoint.get("seed")) != int(seed):
         raise ValueError(f"Checkpoint seed={checkpoint.get('seed')}, expected {seed}")
+    saved_config = checkpoint.get("config", {})
+    current_config = config.as_dict()
+    compatibility_keys = {
+        "run_mode", "checkpoint", "data_seed", "train_images", "val_images",
+        "epochs", "batch_size", "image_size", "lr", "backbone_lr",
+        "weight_decay", "grad_clip", "base_aux_weight", "feature_level",
+        "horizontal_flip_p", "use_amp",
+        "deterministic",
+    }
+    mismatches = {
+        key: (saved_config.get(key), current_config.get(key))
+        for key in compatibility_keys
+        if saved_config.get(key) != current_config.get(key)
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{key}: saved={saved!r}, current={current!r}"
+            for key, (saved, current) in sorted(mismatches.items())
+        )
+        raise ValueError(f"Resume config mismatch: {details}")
 
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -169,7 +189,7 @@ def train_one_experiment(
     if experiment not in GTDeformableDetr.VALID_MODES:
         raise ValueError(f"Unknown experiment: {experiment}")
     print(f"\n===== {experiment} / seed={seed} =====")
-    seed_everything(seed)
+    seed_everything(seed, deterministic=config.deterministic)
     train_loader, val_loader = make_loaders(config, bundle, seed)
     model, fingerprint = make_model(config, experiment, seed)
     optimizer = make_optimizer(model, config)
@@ -180,7 +200,7 @@ def train_one_experiment(
     if resume_from is not None:
         checkpoint, resume_path = _load_resume_checkpoint(
             resume_from, model, optimizer, scheduler, scaler, train_loader,
-            experiment, seed,
+            config, experiment, seed,
         )
         history = list(checkpoint["history"])
         gradient_history = list(checkpoint["gradients"])
@@ -193,7 +213,8 @@ def train_one_experiment(
         print(f"[phase] initial validation complete: mAP={initial_metrics['map']:.4f}, "
               f"AP@0.5={initial_metrics['map50']:.4f}")
         history.append({
-            "experiment": experiment, "seed": seed, "epoch": 0,
+            "experiment": experiment, "seed": seed, "data_seed": config.data_seed,
+            "epoch": 0,
             "model_fingerprint": fingerprint, "train_seconds": 0.0,
             "main_loss": np.nan, "main_bbox_loss": np.nan, "main_giou_loss": np.nan,
             "aux_loss": np.nan, "aux_l1": np.nan, "aux_giou": np.nan,
@@ -224,7 +245,8 @@ def train_one_experiment(
                     result["main_loss"], weight * result["aux_loss"], parameters
                 )
                 gradient_history.append({
-                    "experiment": experiment, "seed": seed, "epoch": epoch,
+                    "experiment": experiment, "seed": seed,
+                    "data_seed": config.data_seed, "epoch": epoch,
                     "cosine": cosine, "main_grad_norm": main_norm,
                     "weighted_aux_grad_norm": aux_norm,
                     "norm_ratio": aux_norm / max(main_norm, 1e-12),
@@ -261,7 +283,8 @@ def train_one_experiment(
         batches = max(sums["batches"], 1)
         aux_batches = max(sums["aux_batches"], 1)
         row = {
-            "experiment": experiment, "seed": seed, "epoch": epoch,
+            "experiment": experiment, "seed": seed, "data_seed": config.data_seed,
+            "epoch": epoch,
             "model_fingerprint": fingerprint, "train_seconds": elapsed_train,
             "main_loss": sums["main_loss"] / batches,
             "main_bbox_loss": sums["main_bbox_loss"] / batches,
