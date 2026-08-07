@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import gc
 import math
+import random
 import time
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -89,17 +91,70 @@ def gradient_cosine(main_loss, aux_loss, parameters):
     return float(cosine), float(main_norm), float(aux_norm)
 
 
-def _save_checkpoint(model, config, experiment, seed, epoch, history, gradients):
+def _save_checkpoint(
+    model, optimizer, scheduler, scaler, train_loader, config,
+    experiment, seed, epoch, elapsed_train, history, gradients,
+):
     state = {
         "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
         "config": config.as_dict(), "experiment": experiment, "seed": seed,
-        "epoch": epoch, "history": history.to_dict("records"),
+        "epoch": epoch, "elapsed_train": elapsed_train,
+        "history": history.to_dict("records"),
         "gradients": gradients.to_dict("records"),
+        "python_rng_state": random.getstate(),
+        "numpy_rng_state": np.random.get_state(),
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state_all": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        ),
+        "loader_generator_state": train_loader.generator.get_state(),
     }
     path = config.checkpoint_path(experiment, seed)
     torch.save(state, path)
     if config.save_epoch_checkpoints:
         torch.save(state, path.with_name(path.stem + f"_epoch{epoch}.pt"))
+
+
+def _load_resume_checkpoint(
+    resume_from, model, optimizer, scheduler, scaler, train_loader,
+    experiment, seed,
+):
+    path = Path(resume_from).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Resume checkpoint not found: {path}")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    required = {
+        "model_state_dict", "optimizer_state_dict", "scheduler_state_dict",
+        "scaler_state_dict", "epoch", "elapsed_train", "history", "gradients",
+        "python_rng_state", "numpy_rng_state", "torch_rng_state",
+        "loader_generator_state",
+    }
+    missing = sorted(required.difference(checkpoint))
+    if missing:
+        raise ValueError(
+            "Checkpoint cannot resume training; missing state: " + ", ".join(missing)
+        )
+    if checkpoint.get("experiment") != experiment:
+        raise ValueError(
+            f"Checkpoint experiment={checkpoint.get('experiment')!r}, expected {experiment!r}"
+        )
+    if int(checkpoint.get("seed")) != int(seed):
+        raise ValueError(f"Checkpoint seed={checkpoint.get('seed')}, expected {seed}")
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    scaler.load_state_dict(checkpoint["scaler_state_dict"])
+    train_loader.generator.set_state(checkpoint["loader_generator_state"])
+    random.setstate(checkpoint["python_rng_state"])
+    np.random.set_state(checkpoint["numpy_rng_state"])
+    torch.set_rng_state(checkpoint["torch_rng_state"])
+    if torch.cuda.is_available() and checkpoint.get("cuda_rng_state_all") is not None:
+        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state_all"])
+    return checkpoint, path
 
 
 def train_one_experiment(
@@ -108,6 +163,7 @@ def train_one_experiment(
     experiment: str,
     seed: int | None = None,
     save_checkpoint: bool = True,
+    resume_from: str | Path | None = None,
 ):
     seed = config.seed if seed is None else seed
     if experiment not in GTDeformableDetr.VALID_MODES:
@@ -119,23 +175,33 @@ def train_one_experiment(
     optimizer = make_optimizer(model, config)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(config.epochs, 1))
     scaler = torch.amp.GradScaler("cuda", enabled=config.use_amp)
-    history, gradient_history = [], []
-    elapsed_train = 0.0
+    history, gradient_history, elapsed_train, start_epoch = [], [], 0.0, 1
 
-    print(f"[phase] initial main-only validation: {len(val_loader)} batches")
-    initial_metrics = evaluate_main(model, val_loader, bundle.processor, config)
-    print(f"[phase] initial validation complete: mAP={initial_metrics['map']:.4f}, "
-          f"AP@0.5={initial_metrics['map50']:.4f}")
-    history.append({
-        "experiment": experiment, "seed": seed, "epoch": 0,
-        "model_fingerprint": fingerprint, "train_seconds": 0.0,
-        "main_loss": np.nan, "main_bbox_loss": np.nan, "main_giou_loss": np.nan,
-        "aux_loss": np.nan, "aux_l1": np.nan, "aux_giou": np.nan,
-        "aux_coverage": np.nan, "collision_rate": np.nan, "aux_weight_mean": 0.0,
-        **initial_metrics,
-    })
+    if resume_from is not None:
+        checkpoint, resume_path = _load_resume_checkpoint(
+            resume_from, model, optimizer, scheduler, scaler, train_loader,
+            experiment, seed,
+        )
+        history = list(checkpoint["history"])
+        gradient_history = list(checkpoint["gradients"])
+        elapsed_train = float(checkpoint["elapsed_train"])
+        start_epoch = int(checkpoint["epoch"]) + 1
+        print(f"[resume] loaded {resume_path}; continuing at epoch {start_epoch}")
+    else:
+        print(f"[phase] initial main-only validation: {len(val_loader)} batches")
+        initial_metrics = evaluate_main(model, val_loader, bundle.processor, config)
+        print(f"[phase] initial validation complete: mAP={initial_metrics['map']:.4f}, "
+              f"AP@0.5={initial_metrics['map50']:.4f}")
+        history.append({
+            "experiment": experiment, "seed": seed, "epoch": 0,
+            "model_fingerprint": fingerprint, "train_seconds": 0.0,
+            "main_loss": np.nan, "main_bbox_loss": np.nan, "main_giou_loss": np.nan,
+            "aux_loss": np.nan, "aux_l1": np.nan, "aux_giou": np.nan,
+            "aux_coverage": np.nan, "collision_rate": np.nan, "aux_weight_mean": 0.0,
+            **initial_metrics,
+        })
 
-    for epoch in range(1, config.epochs + 1):
+    for epoch in range(start_epoch, config.epochs + 1):
         print(f"[phase] training epoch {epoch}/{config.epochs}: {len(train_loader)} batches")
         model.train()
         sums = Counter()
@@ -222,7 +288,10 @@ def train_one_experiment(
         history_df.to_csv(config.history_path(experiment, seed), index=False)
         gradients_df.to_csv(config.gradients_path(experiment, seed), index=False)
         if save_checkpoint:
-            _save_checkpoint(model, config, experiment, seed, epoch, history_df, gradients_df)
+            _save_checkpoint(
+                model, optimizer, scheduler, scaler, train_loader, config,
+                experiment, seed, epoch, elapsed_train, history_df, gradients_df,
+            )
 
     return model, pd.DataFrame(history), pd.DataFrame(
         gradient_history, columns=GRADIENT_COLUMNS
@@ -231,9 +300,11 @@ def train_one_experiment(
 
 def release_model(model):
     if model is None:
-        return
+        return None
     model.close()
+    model.cpu()
     del model
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    return None
