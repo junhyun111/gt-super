@@ -17,6 +17,12 @@ from .eval import evaluate_main
 from .model import GTDeformableDetr, make_model
 
 
+GRADIENT_COLUMNS = [
+    "experiment", "seed", "epoch", "cosine", "main_grad_norm",
+    "weighted_aux_grad_norm", "norm_ratio",
+]
+
+
 def move_labels_to_device(labels, device):
     return [{key: value.to(device) for key, value in target.items()} for target in labels]
 
@@ -199,13 +205,17 @@ def train_one_experiment(
                if key in {"epoch", "main_loss", "aux_loss", "map", "map50", "map75",
                           "aux_coverage", "collision_rate"}})
         history_df = pd.DataFrame(history)
-        gradients_df = pd.DataFrame(gradient_history)
+        # Preserve the CSV schema even when an experiment (for example,
+        # baseline) does not produce auxiliary-gradient measurements.
+        gradients_df = pd.DataFrame(gradient_history, columns=GRADIENT_COLUMNS)
         history_df.to_csv(config.history_path(experiment, seed), index=False)
         gradients_df.to_csv(config.gradients_path(experiment, seed), index=False)
         if save_checkpoint:
             _save_checkpoint(model, config, experiment, seed, epoch, history_df, gradients_df)
 
-    return model, pd.DataFrame(history), pd.DataFrame(gradient_history)
+    return model, pd.DataFrame(history), pd.DataFrame(
+        gradient_history, columns=GRADIENT_COLUMNS
+    )
 
 
 def release_model(model):

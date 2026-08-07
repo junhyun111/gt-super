@@ -15,11 +15,8 @@ __pycache__/
 data/
 cache/
 
-# Training outputs and checkpoints
-outputs/
-*.pt
-*.pth
-*.ckpt
+
+
 
 # Editor and operating-system files
 .vscode/

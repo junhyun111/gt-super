@@ -28,9 +28,9 @@ class ExperimentConfig:
     seed: int = 42
     full_train_images: int = 3000
     full_val_images: int = 750
-    smoke_train_images: int = 300
+    smoke_train_images: int = 400
     smoke_val_images: int = 100
-    smoke_epochs: int = 3
+    smoke_epochs: int = 7
     full_epochs: int = 7
     batch_size: int | None = None
     num_workers: int = 0
