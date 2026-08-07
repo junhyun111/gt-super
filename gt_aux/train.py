@@ -98,7 +98,8 @@ def _save_checkpoint(model, config, experiment, seed, epoch, history, gradients)
     }
     path = config.checkpoint_path(experiment, seed)
     torch.save(state, path)
-    torch.save(state, path.with_name(path.stem + f"_epoch{epoch}.pt"))
+    if config.save_epoch_checkpoints:
+        torch.save(state, path.with_name(path.stem + f"_epoch{epoch}.pt"))
 
 
 def train_one_experiment(

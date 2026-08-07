@@ -47,9 +47,39 @@ class ExperimentConfig:
     horizontal_flip_p: float = 0.5
     use_amp: bool | None = None
     disable_custom_kernels: bool | None = None
+    save_epoch_checkpoints: bool = False
     experiments: list[str] = field(default_factory=lambda: [
         "baseline", "shared_detach", "shared_e2e",
     ])
+
+    @classmethod
+    def for_run(
+        cls,
+        root: Path,
+        *,
+        run_mode: str,
+        train_images: int,
+        val_images: int,
+        epochs: int,
+        image_min_size: int,
+        image_max_size: int,
+        **kwargs,
+    ) -> "ExperimentConfig":
+        """Build one run from explicit notebook-facing settings.
+
+        The dataclass keeps smoke/full defaults for backwards compatibility,
+        while notebooks can configure the active run without editing this file.
+        """
+        if run_mode not in {"smoke", "full"}:
+            raise ValueError("run_mode must be 'smoke' or 'full'")
+        active_values = {
+            f"{run_mode}_train_images": train_images,
+            f"{run_mode}_val_images": val_images,
+            f"{run_mode}_epochs": epochs,
+            f"image_min_size_{run_mode}": image_min_size,
+            f"image_max_size_{run_mode}": image_max_size,
+        }
+        return cls(root=root, run_mode=run_mode, **active_values, **kwargs)
 
     def __post_init__(self):
         self.root = Path(self.root).resolve()
@@ -61,6 +91,28 @@ class ExperimentConfig:
             self.use_amp = torch.cuda.is_available()
         if self.disable_custom_kernels is None:
             self.disable_custom_kernels = os.name == "nt" or not torch.cuda.is_available()
+        positive_values = {
+            "train_images": self.train_images,
+            "val_images": self.val_images,
+            "epochs": self.epochs,
+            "batch_size": self.batch_size,
+            "image_min_size": self.image_size["shortest_edge"],
+            "image_max_size": self.image_size["longest_edge"],
+            "lr": self.lr,
+            "backbone_lr": self.backbone_lr,
+            "grad_clip": self.grad_clip,
+        }
+        invalid = [name for name, value in positive_values.items() if value is None or value <= 0]
+        if invalid:
+            raise ValueError(f"These settings must be positive: {', '.join(invalid)}")
+        if self.image_size["shortest_edge"] > self.image_size["longest_edge"]:
+            raise ValueError("image_min_size must not exceed image_max_size")
+        if not 0.0 <= self.horizontal_flip_p <= 1.0:
+            raise ValueError("horizontal_flip_p must be between 0 and 1")
+        if self.base_aux_weight < 0:
+            raise ValueError("base_aux_weight must be non-negative")
+        if self.num_workers < 0:
+            raise ValueError("num_workers must be non-negative")
 
     @property
     def data_dir(self) -> Path:
@@ -122,8 +174,17 @@ class ExperimentConfig:
     def as_dict(self) -> dict:
         return {
             "root": str(self.root), "run_mode": self.run_mode,
+            "checkpoint": self.checkpoint,
             "train_images": self.train_images, "val_images": self.val_images,
             "epochs": self.epochs, "batch_size": self.batch_size,
+            "num_workers": self.num_workers, "image_size": self.image_size,
+            "lr": self.lr, "backbone_lr": self.backbone_lr,
+            "weight_decay": self.weight_decay, "grad_clip": self.grad_clip,
+            "base_aux_weight": self.base_aux_weight,
+            "feature_level": self.feature_level,
+            "horizontal_flip_p": self.horizontal_flip_p,
+            "use_amp": self.use_amp,
+            "save_epoch_checkpoints": self.save_epoch_checkpoints,
             "device": str(self.device), "experiments": list(self.experiments),
             "seed": self.seed,
         }
