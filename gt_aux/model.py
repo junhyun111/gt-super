@@ -96,7 +96,7 @@ def assert_hf_bbox_heads_are_tied(detector):
 
 class GTDeformableDetr(nn.Module):
     VALID_MODES = {
-        "baseline", "separate", "shared_detach", "shared_e2e",
+        "baseline", "separate", "separate_e2e", "shared_detach", "shared_e2e",
         "shared_decay", "shared_late_decay", "random_patch", "no_adapter",
     }
 
@@ -123,6 +123,10 @@ class GTDeformableDetr(nn.Module):
     @property
     def shared_bbox_head(self):
         return self.detector.bbox_embed[-1]
+
+    @property
+    def aux_bbox_head(self):
+        return self.separate_bbox_head
 
     def _capture_encoder(self, module, args, kwargs, output):
         required = {"spatial_shapes", "level_start_index", "attention_mask"}
@@ -234,7 +238,8 @@ class GTDeformableDetr(nn.Module):
         if self.mode == "shared_detach":
             raw_features = raw_features.detach()
         adapted = raw_features if self.mode == "no_adapter" else self.adapter(raw_features)
-        head = self.separate_bbox_head if self.mode == "separate" else self.shared_bbox_head
+        separate_modes = {"separate", "separate_e2e"}
+        head = self.aux_bbox_head if self.mode in separate_modes else self.shared_bbox_head
         predicted = self.decode_with_reference(adapted, selected["references"], head=head)
         target_boxes = selected["targets"]
         loss_l1 = F.l1_loss(predicted, target_boxes, reduction="none").sum() / used

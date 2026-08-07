@@ -239,7 +239,8 @@ def train_one_experiment(
                 result = model(pixel_values=pixel_values, pixel_mask=pixel_mask,
                                labels=labels, aux_weight=weight)
 
-            if step == 0 and result["aux_executed"] and experiment != "separate":
+            separate_modes = {"separate", "separate_e2e"}
+            if step == 0 and result["aux_executed"] and experiment not in separate_modes:
                 parameters = unique_parameters(model.shared_bbox_head.parameters())
                 cosine, main_norm, aux_norm = gradient_cosine(
                     result["main_loss"], weight * result["aux_loss"], parameters
