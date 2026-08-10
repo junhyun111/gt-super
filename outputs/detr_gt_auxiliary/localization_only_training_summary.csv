@@ -1,0 +1,4 @@
+,map,map,map,map50,map50,map50,map75,map75,map75,mar100,mar100,mar100,main_loss,main_loss,main_loss,aux_loss,aux_loss,aux_loss,total_loss,total_loss,total_loss
+,mean,std,count,mean,std,count,mean,std,count,mean,std,count,mean,std,count,mean,std,count,mean,std,count
+experiment,,,,,,,,,,,,,,,,,,,,,
+localization_only,0.26112608611583704,0.013411527591227334,2,0.4762076139450073,0.01283691853205412,2,0.25068522989749903,0.0032720073638704624,2,0.6255626976490021,0.01068620699939165,2,1.2394893378019334,0.04513897593401165,2,,,0,1.2394893378019334,0.04513897593401165,2

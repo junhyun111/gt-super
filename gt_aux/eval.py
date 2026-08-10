@@ -15,7 +15,27 @@ from tqdm.auto import tqdm
 
 from .config import ID2LABEL, ExperimentConfig
 from .data import DataBundle, VOCDataset, collate_detection_batch, make_loaders
-from .model import make_model
+from .model import box_iou, make_model
+
+
+def class_agnostic_items(predictions, targets):
+    """Remove semantic labels while preserving boxes and ranking scores."""
+    agnostic_predictions = [
+        {
+            "boxes": prediction["boxes"],
+            "scores": prediction["scores"],
+            "labels": torch.zeros_like(prediction["labels"]),
+        }
+        for prediction in predictions
+    ]
+    agnostic_targets = [
+        {
+            "boxes": target["boxes"],
+            "labels": torch.zeros_like(target["labels"]),
+        }
+        for target in targets
+    ]
+    return agnostic_predictions, agnostic_targets
 
 
 @torch.inference_mode()
@@ -42,6 +62,8 @@ def evaluate_main(model, val_loader, processor, config: ExperimentConfig):
                        for prediction in predictions]
         targets = [{"boxes": target["boxes"].cpu(), "labels": target["labels"].cpu()}
                    for target in batch["eval_targets"]]
+        if model.is_localization_only:
+            predictions, targets = class_agnostic_items(predictions, targets)
         metric.update(predictions, targets)
     assert model.aux_forward_calls == calls_before
     values = metric.compute()
@@ -49,6 +71,130 @@ def evaluate_main(model, val_loader, processor, config: ExperimentConfig):
         "map": float(values["map"]), "map50": float(values["map_50"]),
         "map75": float(values["map_75"]), "mar100": float(values["mar_100"]),
         "val_seconds": time.perf_counter() - start,
+    }
+
+
+@torch.inference_mode()
+def collect_localization_predictions(model, val_loader, processor, config: ExperimentConfig):
+    """Collect main-path predictions and class-agnostic targets for localization evaluation."""
+    model.eval()
+    predictions, targets = [], []
+    calls_before = model.aux_forward_calls
+    for batch in tqdm(val_loader, desc="class-agnostic localization", leave=False, mininterval=0.5):
+        result = model(
+            pixel_values=batch["pixel_values"].to(config.device, non_blocking=True),
+            pixel_mask=batch["pixel_mask"].to(config.device, non_blocking=True),
+            labels=None,
+        )
+        assert result["aux_executed"] is False
+        target_sizes = torch.stack([
+            target["orig_size"] for target in batch["eval_targets"]
+        ]).to(config.device)
+        batch_predictions = processor.post_process_object_detection(
+            result["outputs"], threshold=0.0, target_sizes=target_sizes
+        )
+        batch_predictions = [
+            {key: value.detach().cpu() for key, value in prediction.items()}
+            for prediction in batch_predictions
+        ]
+        batch_targets = [
+            {
+                "boxes": target["boxes"].cpu(),
+                "labels": target["labels"].cpu(),
+                "orig_size": target["orig_size"].cpu(),
+                "image_id": target["image_id"],
+            }
+            for target in batch["eval_targets"]
+        ]
+        agnostic_predictions, agnostic_targets = class_agnostic_items(
+            batch_predictions, batch_targets
+        )
+        predictions.extend(agnostic_predictions)
+        for agnostic, original in zip(agnostic_targets, batch_targets):
+            agnostic["orig_size"] = original["orig_size"]
+            agnostic["image_id"] = original["image_id"]
+            targets.append(agnostic)
+    assert model.aux_forward_calls == calls_before
+    return predictions, targets
+
+
+def localization_metrics(predictions, targets):
+    """Compute ranking-aware class-agnostic COCO localization metrics."""
+    metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox")
+    metric.update(
+        predictions,
+        [{"boxes": target["boxes"], "labels": target["labels"]} for target in targets],
+    )
+    values = metric.compute()
+    keys = {
+        "loc_map": "map", "loc_ap50": "map_50", "loc_ap75": "map_75",
+        "loc_ap_small": "map_small", "loc_ap_medium": "map_medium",
+        "loc_ap_large": "map_large", "loc_ar100": "mar_100",
+    }
+    result = {}
+    for name, source in keys.items():
+        value = float(values[source])
+        result[name] = value if value >= 0 else float("nan")
+    return result
+
+
+def localization_geometry_metrics(predictions, targets, max_detections: int = 100):
+    """Measure one-to-one box geometry, independent of semantic correctness.
+
+    Predictions are first limited by score, then greedily matched by descending
+    IoU. This complements AP by exposing center/size quality directly.
+    """
+    matched_ious, center_errors, size_errors = [], [], []
+    gt_count = 0
+    for prediction, target in zip(predictions, targets):
+        gt_boxes = target["boxes"].float()
+        gt_count += len(gt_boxes)
+        order = prediction["scores"].argsort(descending=True)[:max_detections]
+        pred_boxes = prediction["boxes"][order].float()
+        if not len(gt_boxes) or not len(pred_boxes):
+            continue
+        pairwise_iou = box_iou(pred_boxes, gt_boxes)[0]
+        available_predictions = torch.ones(len(pred_boxes), dtype=torch.bool)
+        available_targets = torch.ones(len(gt_boxes), dtype=torch.bool)
+        pairs = []
+        for _ in range(min(len(pred_boxes), len(gt_boxes))):
+            candidate = pairwise_iou.clone()
+            candidate[~available_predictions] = -1
+            candidate[:, ~available_targets] = -1
+            flat_index = int(candidate.argmax())
+            pred_index = flat_index // len(gt_boxes)
+            target_index = flat_index % len(gt_boxes)
+            if candidate[pred_index, target_index] < 0:
+                break
+            pairs.append((pred_index, target_index))
+            available_predictions[pred_index] = False
+            available_targets[target_index] = False
+        if not pairs:
+            continue
+        pred_indices = torch.tensor([pair[0] for pair in pairs])
+        target_indices = torch.tensor([pair[1] for pair in pairs])
+        matched_pred = pred_boxes[pred_indices]
+        matched_gt = gt_boxes[target_indices]
+        ious = pairwise_iou[pred_indices, target_indices]
+        height, width = target["orig_size"].float()
+        scale = gt_boxes.new_tensor([width, height])
+        pred_centers = (matched_pred[:, :2] + matched_pred[:, 2:]) / 2 / scale
+        gt_centers = (matched_gt[:, :2] + matched_gt[:, 2:]) / 2 / scale
+        pred_sizes = (matched_pred[:, 2:] - matched_pred[:, :2]) / scale
+        gt_sizes = (matched_gt[:, 2:] - matched_gt[:, :2]) / scale
+        matched_ious.extend(ious.tolist())
+        center_errors.extend((pred_centers - gt_centers).norm(dim=-1).tolist())
+        size_errors.extend((pred_sizes - gt_sizes).abs().sum(dim=-1).tolist())
+    matched = len(matched_ious)
+    iou_tensor = torch.tensor(matched_ious) if matched else torch.empty(0)
+    return {
+        "matched_iou": float(iou_tensor.mean()) if matched else float("nan"),
+        "center_error_l2": float(torch.tensor(center_errors).mean()) if matched else float("nan"),
+        "size_error_l1": float(torch.tensor(size_errors).mean()) if matched else float("nan"),
+        "geometry_recall50": float((iou_tensor >= 0.50).sum()) / max(gt_count, 1),
+        "geometry_recall75": float((iou_tensor >= 0.75).sum()) / max(gt_count, 1),
+        "matched_boxes": matched,
+        "gt_boxes": gt_count,
     }
 
 
@@ -163,7 +309,8 @@ def visualize_main_predictions(config: ExperimentConfig, bundle: DataBundle, exp
         for score, label, box in zip(prediction["scores"].cpu(), prediction["labels"].cpu(), prediction["boxes"].cpu()):
             coords = box.tolist()
             draw.rectangle(coords, outline="orange", width=2)
-            draw.text((coords[0], coords[1]), f"{ID2LABEL[int(label)]} {float(score):.2f}", fill="orange")
+            label_name = "object" if model.is_localization_only else ID2LABEL[int(label)]
+            draw.text((coords[0], coords[1]), f"{label_name} {float(score):.2f}", fill="orange")
         axis.imshow(image)
         axis.set_title("green=GT, orange=main query")
         axis.axis("off")

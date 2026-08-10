@@ -16,7 +16,12 @@ from tqdm.auto import tqdm
 from .config import ExperimentConfig, seed_everything
 from .data import DataBundle, make_loaders
 from .eval import evaluate_main
-from .model import GTDeformableDetr, make_model
+from .model import (
+    GTDeformableDetr,
+    LOCALIZATION_AUX_WEIGHTS,
+    NO_AUX_MODES,
+    make_model,
+)
 
 
 GRADIENT_COLUMNS = [
@@ -30,8 +35,10 @@ def move_labels_to_device(labels, device):
 
 
 def auxiliary_weight(experiment: str, progress: float, total_epochs: int, base_weight: float) -> float:
-    if experiment == "baseline":
+    if experiment in NO_AUX_MODES:
         return 0.0
+    if experiment in LOCALIZATION_AUX_WEIGHTS:
+        return LOCALIZATION_AUX_WEIGHTS[experiment]
     if experiment == "shared_late_decay":
         # Keep full auxiliary supervision through the early/middle phase, then
         # reduce its magnitude when the main and auxiliary objectives may begin
@@ -216,7 +223,9 @@ def train_one_experiment(
             "experiment": experiment, "seed": seed, "data_seed": config.data_seed,
             "epoch": 0,
             "model_fingerprint": fingerprint, "train_seconds": 0.0,
-            "main_loss": np.nan, "main_bbox_loss": np.nan, "main_giou_loss": np.nan,
+            "total_loss": np.nan, "main_loss": np.nan,
+            "main_cls_or_obj_loss": np.nan,
+            "main_bbox_loss": np.nan, "main_giou_loss": np.nan,
             "aux_loss": np.nan, "aux_l1": np.nan, "aux_giou": np.nan,
             "aux_coverage": np.nan, "collision_rate": np.nan, "aux_weight_mean": 0.0,
             **initial_metrics,
@@ -262,7 +271,9 @@ def train_one_experiment(
 
             loss_dict = result["outputs"].loss_dict or {}
             sums["batches"] += 1
+            sums["total_loss"] += float(result["loss"].detach())
             sums["main_loss"] += float(result["main_loss"].detach())
+            sums["main_cls_or_obj_loss"] += float(loss_dict.get("loss_ce", torch.tensor(float("nan"), device=config.device)).detach())
             sums["main_bbox_loss"] += float(loss_dict.get("loss_bbox", torch.tensor(float("nan"), device=config.device)).detach())
             sums["main_giou_loss"] += float(loss_dict.get("loss_giou", torch.tensor(float("nan"), device=config.device)).detach())
             sums["aux_weight"] += weight
@@ -287,7 +298,9 @@ def train_one_experiment(
             "experiment": experiment, "seed": seed, "data_seed": config.data_seed,
             "epoch": epoch,
             "model_fingerprint": fingerprint, "train_seconds": elapsed_train,
+            "total_loss": sums["total_loss"] / batches,
             "main_loss": sums["main_loss"] / batches,
+            "main_cls_or_obj_loss": sums["main_cls_or_obj_loss"] / batches,
             "main_bbox_loss": sums["main_bbox_loss"] / batches,
             "main_giou_loss": sums["main_giou_loss"] / batches,
             "aux_loss": sums["aux_loss"] / aux_batches if sums["aux_batches"] else np.nan,
@@ -303,7 +316,7 @@ def train_one_experiment(
         }
         history.append(row)
         print({key: round(value, 4) for key, value in row.items()
-               if key in {"epoch", "main_loss", "aux_loss", "map", "map50", "map75",
+               if key in {"epoch", "total_loss", "main_loss", "aux_loss", "map", "map50", "map75",
                           "aux_coverage", "collision_rate"}})
         history_df = pd.DataFrame(history)
         # Preserve the CSV schema even when an experiment (for example,

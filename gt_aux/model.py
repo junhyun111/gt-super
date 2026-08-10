@@ -11,6 +11,21 @@ from transformers import AutoConfig, DeformableDetrForObjectDetection
 from .config import ID2LABEL, LABEL2ID, ExperimentConfig, model_fingerprint, seed_everything
 
 
+LOCALIZATION_BASELINE_MODE = "localization_only"
+LOCALIZATION_AUX_WEIGHTS = {
+    "localization_gt_e2e_aux010": 0.10,
+    "localization_gt_e2e_aux025": 0.25,
+    "localization_gt_e2e_aux050": 0.50,
+}
+LOCALIZATION_MODES = {LOCALIZATION_BASELINE_MODE, *LOCALIZATION_AUX_WEIGHTS}
+NO_AUX_MODES = {"baseline", LOCALIZATION_BASELINE_MODE}
+
+
+def is_localization_mode(mode: str) -> bool:
+    """Return whether ``mode`` predicts class-agnostic objectness and boxes."""
+    return mode in LOCALIZATION_MODES
+
+
 def inverse_sigmoid(tensor, eps=1e-5):
     tensor = tensor.clamp(0, 1)
     return torch.log(tensor.clamp(min=eps) / (1 - tensor).clamp(min=eps))
@@ -63,7 +78,12 @@ class ResidualPatchAdapter(nn.Module):
         return features + self.fc2(F.gelu(self.fc1(self.norm(features))))
 
 
-def build_detector(config: ExperimentConfig, initialization_seed: int | None = None):
+def build_detector(
+    config: ExperimentConfig,
+    initialization_seed: int | None = None,
+    *,
+    localization_only: bool = False,
+):
     seed_everything(config.seed if initialization_seed is None else initialization_seed)
     try:
         model_config = AutoConfig.from_pretrained(config.checkpoint, local_files_only=True)
@@ -75,9 +95,25 @@ def build_detector(config: ExperimentConfig, initialization_seed: int | None = N
     assert model_config.two_stage is False
     assert model_config.with_box_refine is False
     assert model_config.num_feature_levels == 4
-    model_config.num_labels = len(LABEL2ID)
-    model_config.id2label = ID2LABEL
-    model_config.label2id = LABEL2ID
+    if localization_only:
+        # A single sigmoid logit is binary objectness. The Hugging Face
+        # Deformable-DETR criterion then performs Hungarian matching with
+        # objectness + L1 + GIoU costs and computes focal objectness loss.
+        model_config.num_labels = 1
+        model_config.id2label = {0: "object"}
+        model_config.label2id = {"object": 0}
+        # Preserve the integer field types from DeformableDetrConfig. Recent
+        # huggingface_hub versions validate dataclass assignments strictly.
+        model_config.class_cost = 1
+        model_config.bbox_cost = 5
+        model_config.giou_cost = 2
+        model_config.bbox_loss_coefficient = 5
+        model_config.giou_loss_coefficient = 2
+        model_config.focal_alpha = 0.25
+    else:
+        model_config.num_labels = len(LABEL2ID)
+        model_config.id2label = ID2LABEL
+        model_config.label2id = LABEL2ID
     model_config.auxiliary_loss = False
     model_config.disable_custom_kernels = config.disable_custom_kernels
     return DeformableDetrForObjectDetection.from_pretrained(
@@ -98,6 +134,7 @@ class GTDeformableDetr(nn.Module):
     VALID_MODES = {
         "baseline", "separate", "separate_e2e", "shared_detach", "shared_e2e",
         "shared_decay", "shared_late_decay", "random_patch", "no_adapter",
+        *LOCALIZATION_MODES,
     }
 
     def __init__(self, detector, mode: str, feature_level: int = 0):
@@ -106,6 +143,7 @@ class GTDeformableDetr(nn.Module):
             raise ValueError(f"Unknown mode: {mode}")
         self.detector = detector
         self.mode = mode
+        self.is_localization_only = is_localization_mode(mode)
         self.feature_level = feature_level
         self.adapter = ResidualPatchAdapter(detector.config.d_model)
         self.separate_bbox_head = copy.deepcopy(detector.bbox_embed[-1])
@@ -254,16 +292,38 @@ class GTDeformableDetr(nn.Module):
         }
         return weighted, loss_l1, loss_giou, selected, stats
 
+    @staticmethod
+    def _objectness_labels(labels):
+        """Map semantic targets to one foreground class without mutating a batch."""
+        if labels is None:
+            return None
+        objectness_labels = []
+        for target in labels:
+            converted = dict(target)
+            converted["class_labels"] = torch.zeros_like(target["class_labels"])
+            objectness_labels.append(converted)
+        return objectness_labels
+
     def forward(self, pixel_values, pixel_mask=None, labels=None, aux_weight=0.0):
         self._encoder_cache = {}
-        outputs = self.detector(pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels)
+        detector_labels = self._objectness_labels(labels) if self.is_localization_only else labels
+        outputs = self.detector(
+            pixel_values=pixel_values,
+            pixel_mask=pixel_mask,
+            labels=detector_labels,
+        )
         result = {
             "outputs": outputs, "loss": outputs.loss, "main_loss": outputs.loss,
             "aux_loss": None, "aux_l1": None, "aux_giou": None,
             "aux_executed": False, "aux_total": 0, "aux_used": 0,
             "aux_collisions": 0, "feature_stats": {},
         }
-        should_run_aux = self.training and labels is not None and self.mode != "baseline" and aux_weight > 0
+        should_run_aux = (
+            self.training
+            and labels is not None
+            and self.mode not in NO_AUX_MODES
+            and aux_weight > 0
+        )
         if not should_run_aux:
             return result
         aux_loss, aux_l1, aux_giou, selected, stats = self.auxiliary_loss(labels, outputs)
@@ -278,9 +338,29 @@ class GTDeformableDetr(nn.Module):
         return result
 
 
+class LocalizationOnlyGTDeformableDetr(GTDeformableDetr):
+    """Deformable DETR with binary objectness and shared GT box refinement.
+
+    The detector owns a one-channel objectness head. Semantic VOC labels are
+    mapped to foreground before the Hugging Face criterion, so matching and
+    the main loss are class-agnostic while the inherited GT auxiliary path
+    continues to supervise the shared bbox head and encoder representation.
+    """
+
+    def __init__(self, detector, mode: str, feature_level: int = 0):
+        if not is_localization_mode(mode):
+            raise ValueError(f"Localization-only model received mode={mode!r}")
+        super().__init__(detector, mode, feature_level)
+
+
 def make_model(config: ExperimentConfig, experiment: str, seed: int | None = None):
     seed = config.seed if seed is None else seed
-    detector = build_detector(config, seed)
+    detector = build_detector(
+        config,
+        seed,
+        localization_only=is_localization_mode(experiment),
+    )
     assert_hf_bbox_heads_are_tied(detector)
-    model = GTDeformableDetr(detector, experiment, config.feature_level).to(config.device)
+    model_type = LocalizationOnlyGTDeformableDetr if is_localization_mode(experiment) else GTDeformableDetr
+    model = model_type(detector, experiment, config.feature_level).to(config.device)
     return model, model_fingerprint(model.detector)

@@ -1,0 +1,3 @@
+experiment,seed,data_seed,epoch,model_fingerprint,train_seconds,total_loss,main_loss,main_cls_or_obj_loss,main_bbox_loss,main_giou_loss,aux_loss,aux_l1,aux_giou,aux_coverage,collision_rate,aux_weight_mean,map,map50,map75,mar100,val_seconds,raw_feature_norm,adapted_feature_norm,decoder_feature_norm
+localization_only,44,42,0,438577bcf4183d72,0.0,,,,,,,,,,,0.0,0.040192242711782455,0.08451707661151886,0.03536314517259598,0.5035369992256165,5.449785500000871,,,
+localization_only,44,42,1,438577bcf4183d72,50.982245799998054,2.420443032979965,2.420443032979965,1.183821863681078,0.11300242647528648,0.33580452427268026,,,,,,0.0,0.0962623581290245,0.2506440281867981,0.03566228598356247,0.509003221988678,5.416996100000688,,,
