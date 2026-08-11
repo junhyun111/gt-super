@@ -1,0 +1,40 @@
+services:
+  train:
+    build:
+      context: .
+      args:
+        PYTORCH_IMAGE: ${PYTORCH_IMAGE:-pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime}
+    image: gt-super-projection-v2:latest
+    shm_size: 16gb
+    environment:
+      HF_HOME: /workspace/hf-cache
+    volumes:
+      - ${COCO_ROOT:?Set COCO_ROOT}:/workspace/data/coco:ro
+      - ${OUTPUT_ROOT:-./artifacts}:/workspace/artifacts
+      - ${HF_CACHE:-./hf-cache}:/workspace/hf-cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - torchrun
+      - --standalone
+      - --nproc_per_node=${NPROC_PER_NODE:-1}
+      - train.py
+      - --data-root
+      - /workspace/data/coco
+      - --output-root
+      - /workspace/artifacts
+      - --epochs
+      - ${EPOCHS:-50}
+      - --batch-size
+      - ${BATCH_SIZE:-2}
+      - --num-workers
+      - ${NUM_WORKERS:-8}
+      - --seed
+      - ${SEED:-42}
+      - --resume
+      - ${RESUME:-auto}
