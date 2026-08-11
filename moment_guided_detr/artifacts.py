@@ -22,9 +22,7 @@ def gradients_path(config: ExperimentConfig, seed: int) -> Path:
 
 
 def checkpoint_path(config: ExperimentConfig, seed: int) -> Path:
-    path = config.root / "cache" / "checkpoints"
-    path.mkdir(parents=True, exist_ok=True)
-    return path / f"checkpoint_{config.run_mode}_{EXPERIMENT_NAME}_seed{seed}.pt"
+    return config.checkpoint_path(EXPERIMENT_NAME, seed)
 
 
 def evaluation_dir(config: ExperimentConfig) -> Path:

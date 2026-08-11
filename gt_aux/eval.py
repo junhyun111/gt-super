@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+from transformers.loss.loss_deformable_detr import DeformableDetrHungarianMatcher
 
 from .config import ID2LABEL, ExperimentConfig
 from .data import DataBundle, VOCDataset, collate_detection_batch, make_loaders
@@ -198,11 +199,123 @@ def localization_geometry_metrics(predictions, targets, max_detections: int = 10
     }
 
 
+@torch.inference_mode()
+def classification_diagnostics(
+    model,
+    val_loader,
+    processor,
+    config: ExperimentConfig,
+    *,
+    score_threshold: float = 0.1,
+    iou_threshold: float = 0.5,
+):
+    """Measure semantic behavior separately from box-localization quality.
+
+    Matched-query accuracy uses the same Hungarian cost as model training.
+    Classification false positives are score-filtered detections whose closest
+    ground-truth box overlaps at ``iou_threshold`` but has another class.
+    """
+    if model.is_localization_only:
+        raise ValueError("Classification diagnostics require a semantic detector")
+    matcher = DeformableDetrHungarianMatcher(
+        class_cost=model.detector.config.class_cost,
+        bbox_cost=model.detector.config.bbox_cost,
+        giou_cost=model.detector.config.giou_cost,
+    )
+    model.eval()
+    calls_before = model.aux_forward_calls
+    loss_sum = 0.0
+    loss_batches = matched_count = matched_correct = 0
+    matched_gt_score_sum = 0.0
+    detection_count = classification_fp = background_fp = image_count = 0
+
+    for batch in tqdm(
+        val_loader, desc="classification diagnostics", leave=False, mininterval=0.5
+    ):
+        labels = [
+            {key: value.to(config.device) for key, value in target.items()}
+            for target in batch["labels"]
+        ]
+        result = model(
+            pixel_values=batch["pixel_values"].to(config.device, non_blocking=True),
+            pixel_mask=batch["pixel_mask"].to(config.device, non_blocking=True),
+            labels=labels,
+            aux_weight=0.0,
+        )
+        outputs = result["outputs"]
+        loss_sum += float(outputs.loss_dict["loss_ce"].detach())
+        loss_batches += 1
+        assignments = matcher(
+            {"logits": outputs.logits, "pred_boxes": outputs.pred_boxes}, labels
+        )
+        probabilities = outputs.logits.sigmoid()
+        for batch_index, (query_indices, target_indices) in enumerate(assignments):
+            if not len(query_indices):
+                continue
+            query_indices = query_indices.to(probabilities.device)
+            target_indices = target_indices.to(probabilities.device)
+            matched_probabilities = probabilities[batch_index, query_indices]
+            matched_targets = labels[batch_index]["class_labels"][target_indices]
+            matched_predictions = matched_probabilities.argmax(dim=-1)
+            matched_correct += int((matched_predictions == matched_targets).sum())
+            matched_count += int(len(query_indices))
+            matched_gt_score_sum += float(
+                matched_probabilities.gather(1, matched_targets[:, None]).sum()
+            )
+
+        target_sizes = torch.stack([
+            target["orig_size"] for target in batch["eval_targets"]
+        ]).to(config.device)
+        predictions = processor.post_process_object_detection(
+            outputs, threshold=score_threshold, target_sizes=target_sizes
+        )
+        for prediction, target in zip(predictions, batch["eval_targets"]):
+            image_count += 1
+            predicted_boxes = prediction["boxes"].detach().cpu()
+            predicted_labels = prediction["labels"].detach().cpu()
+            target_boxes = target["boxes"].cpu()
+            target_labels = target["labels"].cpu()
+            detection_count += len(predicted_boxes)
+            if not len(predicted_boxes):
+                continue
+            if not len(target_boxes):
+                background_fp += len(predicted_boxes)
+                continue
+            overlaps = box_iou(predicted_boxes, target_boxes)[0]
+            best_iou, best_target = overlaps.max(dim=1)
+            foreground = best_iou >= iou_threshold
+            classification_fp += int(
+                (
+                    foreground
+                    & (predicted_labels != target_labels[best_target])
+                ).sum()
+            )
+            background_fp += int((~foreground).sum())
+
+    assert model.aux_forward_calls == calls_before
+    return {
+        "mean_cls_loss": loss_sum / max(loss_batches, 1),
+        "matched_query_class_accuracy": matched_correct / max(matched_count, 1),
+        "matched_query_mean_gt_score": matched_gt_score_sum / max(matched_count, 1),
+        "matched_queries": matched_count,
+        "classification_fp_count": classification_fp,
+        "classification_fp_per_image": classification_fp / max(image_count, 1),
+        "classification_fp_rate": classification_fp / max(detection_count, 1),
+        "background_fp_count": background_fp,
+        "background_fp_per_image": background_fp / max(image_count, 1),
+        "detections_at_threshold": detection_count,
+        "classification_score_threshold": score_threshold,
+        "classification_iou_threshold": iou_threshold,
+    }
+
+
 def load_checkpoint(config: ExperimentConfig, bundle: DataBundle, experiment: str, seed: int | None = None):
     seed = config.seed if seed is None else seed
     model, fingerprint = make_model(config, experiment, seed)
     checkpoint_path = config.checkpoint_path(experiment, seed)
-    checkpoint = torch.load(checkpoint_path, map_location=config.device, weights_only=False)
+    # Evaluation only needs model weights.  Keep optimizer/scheduler tensors in
+    # the returned checkpoint on CPU instead of spending GPU memory on them.
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     assert checkpoint.get("experiment") == experiment
     assert checkpoint.get("model_state_dict")

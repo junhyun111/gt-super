@@ -20,13 +20,20 @@ from .model import (
     GTDeformableDetr,
     LOCALIZATION_AUX_WEIGHTS,
     NO_AUX_MODES,
+    PARAMETER_PROJECTED_MODES,
+    REPRESENTATION_PROJECTED_MODE,
     make_model,
 )
 
 
 GRADIENT_COLUMNS = [
     "experiment", "seed", "data_seed", "epoch", "cosine", "main_grad_norm",
-    "weighted_aux_grad_norm", "norm_ratio",
+    "weighted_aux_grad_norm", "norm_ratio", "step", "projection_scope",
+    "enc_cls_aux_cosine_raw", "enc_cls_aux_dot_raw",
+    "enc_cls_aux_dot_projected", "enc_cls_grad_norm", "enc_aux_grad_norm",
+    "enc_aux_grad_norm_projected", "projection_applied",
+    "projection_removed_ratio", "projection_vector_numel",
+    "projection_vector_mb", "grad_scale", "optimizer_step_skipped",
 ]
 
 
@@ -96,6 +103,165 @@ def gradient_cosine(main_loss, aux_loss, parameters):
     main_norm, aux_norm = main_vector.norm(), aux_vector.norm()
     cosine = F.cosine_similarity(main_vector, aux_vector, dim=0)
     return float(cosine), float(main_norm), float(aux_norm)
+
+
+def project_conflicting_gradient(cls_grads, aux_grads, epsilon: float = 1e-12):
+    """Project one global auxiliary vector off a conflicting classification vector.
+
+    The lists are treated as chunks of one encoder-wide vector.  Auxiliary
+    entries without a corresponding classification gradient are preserved.
+    No tensors are concatenated, which avoids another encoder-sized allocation.
+    """
+    if len(cls_grads) != len(aux_grads):
+        raise ValueError("Classification and auxiliary gradient lists must align")
+    cls_present = [grad for grad in cls_grads if grad is not None]
+    aux_present = [grad for grad in aux_grads if grad is not None]
+    paired = [
+        (cls_grad, aux_grad)
+        for cls_grad, aux_grad in zip(cls_grads, aux_grads)
+        if cls_grad is not None and aux_grad is not None
+    ]
+    if not cls_present or not aux_present or not paired:
+        raise RuntimeError("Projected-E requires classification and auxiliary encoder gradients")
+
+    # Accumulate the global diagnostics in float32 even under autocast.
+    dot = sum(
+        (cls_grad.detach().float() * aux_grad.detach().float()).sum()
+        for cls_grad, aux_grad in paired
+    )
+    cls_norm_sq = sum(
+        grad.detach().float().square().sum() for grad in cls_present
+    )
+    aux_norm_sq = sum(
+        grad.detach().float().square().sum() for grad in aux_present
+    )
+    cls_norm = cls_norm_sq.sqrt()
+    aux_norm = aux_norm_sq.sqrt()
+    cosine = dot / (cls_norm * aux_norm + epsilon)
+    applied = bool((dot < 0).item())
+    coefficient = dot / (cls_norm_sq + epsilon) if applied else dot.new_zeros(())
+
+    projected = []
+    for cls_grad, aux_grad in zip(cls_grads, aux_grads):
+        if aux_grad is None:
+            projected.append(None)
+        elif applied and cls_grad is not None:
+            projected.append(aux_grad - coefficient.to(aux_grad.dtype) * cls_grad)
+        else:
+            projected.append(aux_grad)
+
+    projected_present = [grad for grad in projected if grad is not None]
+    projected_norm = sum(
+        grad.detach().float().square().sum() for grad in projected_present
+    ).sqrt()
+    projected_dot = sum(
+        (cls_grad.detach().float() * projected_grad.detach().float()).sum()
+        for cls_grad, projected_grad in zip(cls_grads, projected)
+        if cls_grad is not None and projected_grad is not None
+    )
+    removed_ratio = 1.0 - projected_norm / (aux_norm + epsilon)
+    stats = {
+        "enc_cls_aux_cosine_raw": float(cosine),
+        "enc_cls_aux_dot_raw": float(dot),
+        "enc_cls_aux_dot_projected": float(projected_dot),
+        "enc_cls_grad_norm": float(cls_norm),
+        "enc_aux_grad_norm": float(aux_norm),
+        "enc_aux_grad_norm_projected": float(projected_norm),
+        "projection_applied": applied,
+        "projection_removed_ratio": float(removed_ratio),
+    }
+    return tuple(projected), stats
+
+
+def _projection_losses(result):
+    loss_dict = result["outputs"].loss_dict or {}
+    if "loss_ce" not in loss_dict:
+        raise KeyError("Gradient projection requires outputs.loss_dict['loss_ce']")
+    if not result["aux_executed"] or result["aux_loss"] is None:
+        raise RuntimeError("Gradient projection requires an executed auxiliary branch")
+    return loss_dict["loss_ce"], result["aux_loss"]
+
+
+def parameter_projected_encoder_gradients(model, result):
+    """V1 ablation: extract two full Transformer-encoder parameter gradients."""
+    loss_cls, loss_aux = _projection_losses(result)
+    parameters = unique_parameters(model.detector.model.encoder.parameters())
+    cls_grads = torch.autograd.grad(
+        loss_cls, parameters, retain_graph=True, allow_unused=True
+    )
+    aux_grads = torch.autograd.grad(
+        loss_aux, parameters, retain_graph=True, allow_unused=True
+    )
+    projected_aux_grads, stats = project_conflicting_gradient(cls_grads, aux_grads)
+    return parameters, aux_grads, projected_aux_grads, stats
+
+
+def projected_encoder_gradients(model, result):
+    """Backward-compatible name for the V1 parameter-space ablation."""
+    return parameter_projected_encoder_gradients(model, result)
+
+
+def representation_projected_gradients(model, result):
+    """V2: project gradients at the single shared encoder-output tensor.
+
+    These two ``autograd.grad`` calls stop at the representation, so they do not
+    traverse the Transformer encoder or backbone.  The normal total backward
+    later propagates one corrected gradient through those shared modules.
+    """
+    loss_cls, loss_aux = _projection_losses(result)
+    representation = model.encoder_representation
+    cls_grad = torch.autograd.grad(
+        loss_cls, representation, retain_graph=True, allow_unused=False
+    )[0]
+    aux_grad = torch.autograd.grad(
+        loss_aux, representation, retain_graph=True, allow_unused=False
+    )[0]
+    (projected_aux_grad,), stats = project_conflicting_gradient(
+        (cls_grad,), (aux_grad,)
+    )
+    return representation, aux_grad, projected_aux_grad, stats
+
+
+def replace_encoder_auxiliary_gradient(
+    parameters, raw_aux_grads, projected_aux_grads, aux_weight: float
+):
+    """Replace the unscaled encoder aux component after the normal backward."""
+    with torch.no_grad():
+        for parameter, raw_aux, projected_aux in zip(
+            parameters, raw_aux_grads, projected_aux_grads
+        ):
+            if parameter.grad is None or raw_aux is None or projected_aux is None:
+                continue
+            parameter.grad.add_(projected_aux - raw_aux, alpha=aux_weight)
+
+
+def register_representation_gradient_correction(
+    representation,
+    raw_aux_grad,
+    projected_aux_grad,
+    aux_weight: float,
+    grad_scale: float = 1.0,
+):
+    """Add the V2 correction to the normal total gradient arriving at ``E``.
+
+    ``GradScaler`` scales the normal backward gradient before hooks run, so the
+    externally computed correction must use the same scale.  The returned hook
+    must be removed immediately after backward.
+    """
+    # The projection helper returns the original object for a non-conflicting
+    # step.  Avoid allocating/scanning a representation-sized all-zero tensor.
+    if projected_aux_grad is raw_aux_grad:
+        return None
+    correction = (
+        (projected_aux_grad - raw_aux_grad).detach()
+        * float(aux_weight)
+        * float(grad_scale)
+    )
+
+    def add_correction(total_grad):
+        return total_grad + correction.to(dtype=total_grad.dtype)
+
+    return representation.register_hook(add_correction)
 
 
 def _save_checkpoint(
@@ -228,6 +394,13 @@ def train_one_experiment(
             "main_bbox_loss": np.nan, "main_giou_loss": np.nan,
             "aux_loss": np.nan, "aux_l1": np.nan, "aux_giou": np.nan,
             "aux_coverage": np.nan, "collision_rate": np.nan, "aux_weight_mean": 0.0,
+            "projection_conflict_rate": np.nan,
+            "enc_cls_aux_cosine_raw_mean": np.nan,
+            "projection_removed_ratio_mean": np.nan,
+            "epoch_train_seconds": np.nan,
+            "iteration_seconds": np.nan,
+            "peak_extra_cuda_mb": np.nan,
+            "optimizer_step_skip_rate": np.nan,
             **initial_metrics,
         })
 
@@ -237,6 +410,11 @@ def train_one_experiment(
         sums = Counter()
         total_objects = used_objects = collision_targets = 0
         epoch_start = time.perf_counter()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(config.device)
+            epoch_memory_start = torch.cuda.memory_allocated(config.device)
+        else:
+            epoch_memory_start = 0
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(tqdm(train_loader, desc=f"{experiment} e{epoch}", leave=False)):
             pixel_values = batch["pixel_values"].to(config.device, non_blocking=True)
@@ -249,7 +427,60 @@ def train_one_experiment(
                                labels=labels, aux_weight=weight)
 
             separate_modes = {"separate", "separate_e2e"}
-            if step == 0 and result["aux_executed"] and experiment not in separate_modes:
+            parameter_projection_state = None
+            representation_hook = None
+            projection_row = None
+            if experiment in PARAMETER_PROJECTED_MODES:
+                parameters, raw_aux_grads, projected_aux_grads, projection_stats = (
+                    parameter_projected_encoder_gradients(model, result)
+                )
+                parameter_projection_state = (
+                    parameters, raw_aux_grads, projected_aux_grads
+                )
+                projection_scope = "transformer_encoder_parameters"
+                projection_vector_numel = sum(
+                    parameter.numel() for parameter in parameters
+                )
+            elif experiment == REPRESENTATION_PROJECTED_MODE:
+                representation, raw_aux_grad, projected_aux_grad, projection_stats = (
+                    representation_projected_gradients(model, result)
+                )
+                representation_hook = register_representation_gradient_correction(
+                    representation,
+                    raw_aux_grad,
+                    projected_aux_grad,
+                    aux_weight=weight,
+                    grad_scale=scaler.get_scale(),
+                )
+                projection_scope = "encoder_output_representation"
+                projection_vector_numel = representation.numel()
+            else:
+                projection_stats = None
+
+            if projection_stats is not None:
+                projection_row = {
+                    "experiment": experiment, "seed": seed,
+                    "data_seed": config.data_seed, "epoch": epoch, "step": step,
+                    "projection_scope": projection_scope,
+                    "projection_vector_numel": projection_vector_numel,
+                    "projection_vector_mb": projection_vector_numel * 4 / 2**20,
+                    "cosine": projection_stats["enc_cls_aux_cosine_raw"],
+                    "main_grad_norm": projection_stats["enc_cls_grad_norm"],
+                    "weighted_aux_grad_norm": (
+                        weight * projection_stats["enc_aux_grad_norm"]
+                    ),
+                    "norm_ratio": (
+                        weight * projection_stats["enc_aux_grad_norm"]
+                        / max(projection_stats["enc_cls_grad_norm"], 1e-12)
+                    ),
+                    **projection_stats,
+                }
+                gradient_history.append(projection_row)
+                sums["projection_steps"] += 1
+                sums["projection_applied"] += int(projection_stats["projection_applied"])
+                sums["enc_cls_aux_cosine_raw"] += projection_stats["enc_cls_aux_cosine_raw"]
+                sums["projection_removed_ratio"] += projection_stats["projection_removed_ratio"]
+            elif step == 0 and result["aux_executed"] and experiment not in separate_modes:
                 parameters = unique_parameters(model.shared_bbox_head.parameters())
                 cosine, main_norm, aux_norm = gradient_cosine(
                     result["main_loss"], weight * result["aux_loss"], parameters
@@ -262,11 +493,28 @@ def train_one_experiment(
                     "norm_ratio": aux_norm / max(main_norm, 1e-12),
                 })
 
-            scaler.scale(result["loss"]).backward()
+            grad_scale = scaler.get_scale()
+            try:
+                scaler.scale(result["loss"]).backward()
+            finally:
+                if representation_hook is not None:
+                    representation_hook.remove()
             scaler.unscale_(optimizer)
+            if parameter_projection_state is not None:
+                replace_encoder_auxiliary_gradient(
+                    *parameter_projection_state, aux_weight=weight
+                )
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
             scaler.step(optimizer)
             scaler.update()
+            optimizer_step_skipped = bool(
+                config.use_amp and scaler.get_scale() < grad_scale
+            )
+            sums["optimizer_steps"] += 1
+            sums["optimizer_steps_skipped"] += int(optimizer_step_skipped)
+            if projection_row is not None:
+                projection_row["grad_scale"] = grad_scale
+                projection_row["optimizer_step_skipped"] = optimizer_step_skipped
             optimizer.zero_grad(set_to_none=True)
 
             loss_dict = result["outputs"].loss_dict or {}
@@ -289,7 +537,12 @@ def train_one_experiment(
             collision_targets += result["aux_collisions"]
 
         scheduler.step()
-        elapsed_train += time.perf_counter() - epoch_start
+        epoch_train_seconds = time.perf_counter() - epoch_start
+        elapsed_train += epoch_train_seconds
+        epoch_peak_extra_cuda_mb = (
+            (torch.cuda.max_memory_allocated(config.device) - epoch_memory_start) / 2**20
+            if torch.cuda.is_available() else np.nan
+        )
         print(f"[phase] validating epoch {epoch}/{config.epochs}: {len(val_loader)} batches")
         metrics = evaluate_main(model, val_loader, bundle.processor, config)
         batches = max(sums["batches"], 1)
@@ -312,6 +565,24 @@ def train_one_experiment(
             "raw_feature_norm": sums["raw_feature_norm"] / aux_batches if sums["aux_batches"] else np.nan,
             "adapted_feature_norm": sums["adapted_feature_norm"] / aux_batches if sums["aux_batches"] else np.nan,
             "decoder_feature_norm": sums["decoder_feature_norm"] / aux_batches if sums["aux_batches"] else np.nan,
+            "projection_conflict_rate": (
+                sums["projection_applied"] / sums["projection_steps"]
+                if sums["projection_steps"] else np.nan
+            ),
+            "enc_cls_aux_cosine_raw_mean": (
+                sums["enc_cls_aux_cosine_raw"] / sums["projection_steps"]
+                if sums["projection_steps"] else np.nan
+            ),
+            "projection_removed_ratio_mean": (
+                sums["projection_removed_ratio"] / sums["projection_steps"]
+                if sums["projection_steps"] else np.nan
+            ),
+            "epoch_train_seconds": epoch_train_seconds,
+            "iteration_seconds": epoch_train_seconds / batches,
+            "peak_extra_cuda_mb": epoch_peak_extra_cuda_mb,
+            "optimizer_step_skip_rate": (
+                sums["optimizer_steps_skipped"] / max(sums["optimizer_steps"], 1)
+            ),
             **metrics,
         }
         history.append(row)

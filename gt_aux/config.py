@@ -138,9 +138,8 @@ class ExperimentConfig:
 
     @property
     def checkpoint_dir(self) -> Path:
-        # Keep epoch checkpoints in the project cache so training artifacts are
-        # available immediately after every epoch without mixing them with
-        # result CSVs and plots under ``outputs``.
+        # Model/seed subdirectories below this root keep epoch snapshots from
+        # different experiments out of one large flat directory.
         path = self.root / "cache" / "checkpoints"
         path.mkdir(parents=True, exist_ok=True)
         return path
@@ -177,7 +176,9 @@ class ExperimentConfig:
 
     def checkpoint_path(self, experiment: str, seed: int | None = None) -> Path:
         seed = self.seed if seed is None else seed
-        return self.checkpoint_dir / f"checkpoint_{self.run_mode}_{experiment}_seed{seed}.pt"
+        model_seed_dir = self.checkpoint_dir / experiment / f"seed_{seed}"
+        model_seed_dir.mkdir(parents=True, exist_ok=True)
+        return model_seed_dir / f"checkpoint_{self.run_mode}_{experiment}_seed{seed}.pt"
 
     def as_dict(self) -> dict:
         return {
