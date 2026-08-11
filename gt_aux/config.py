@@ -50,6 +50,7 @@ class ExperimentConfig:
     disable_custom_kernels: bool | None = None
     deterministic: bool = True
     save_epoch_checkpoints: bool = False
+    checkpoint_group: str | None = None
     experiments: list[str] = field(default_factory=lambda: [
         "baseline", "shared_detach", "shared_e2e",
     ])
@@ -121,6 +122,10 @@ class ExperimentConfig:
             raise ValueError("val_images must not exceed full_val_images")
         if self.weight_decay < 0:
             raise ValueError("weight_decay must be non-negative")
+        if self.checkpoint_group is not None:
+            group = Path(self.checkpoint_group)
+            if group.name != self.checkpoint_group or self.checkpoint_group in {".", ".."}:
+                raise ValueError("checkpoint_group must be one folder name")
 
     @property
     def data_dir(self) -> Path:
@@ -176,7 +181,8 @@ class ExperimentConfig:
 
     def checkpoint_path(self, experiment: str, seed: int | None = None) -> Path:
         seed = self.seed if seed is None else seed
-        model_seed_dir = self.checkpoint_dir / experiment / f"seed_{seed}"
+        group = self.checkpoint_group or experiment
+        model_seed_dir = self.checkpoint_dir / group / f"seed_{seed}"
         model_seed_dir.mkdir(parents=True, exist_ok=True)
         return model_seed_dir / f"checkpoint_{self.run_mode}_{experiment}_seed{seed}.pt"
 
@@ -195,6 +201,7 @@ class ExperimentConfig:
             "use_amp": self.use_amp,
             "deterministic": self.deterministic,
             "save_epoch_checkpoints": self.save_epoch_checkpoints,
+            "checkpoint_group": self.checkpoint_group,
             "device": str(self.device), "experiments": list(self.experiments),
             "seed": self.seed, "data_seed": self.data_seed,
         }
