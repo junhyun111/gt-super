@@ -20,7 +20,6 @@ from .model import (
     GTDeformableDetr,
     LOCALIZATION_AUX_WEIGHTS,
     NO_AUX_MODES,
-    PARAMETER_PROJECTED_MODES,
     REPRESENTATION_PROJECTED_MODE,
     make_model,
 )
@@ -182,25 +181,6 @@ def _projection_losses(result):
     return loss_dict["loss_ce"], result["aux_loss"]
 
 
-def parameter_projected_encoder_gradients(model, result):
-    """V1 ablation: extract two full Transformer-encoder parameter gradients."""
-    loss_cls, loss_aux = _projection_losses(result)
-    parameters = unique_parameters(model.detector.model.encoder.parameters())
-    cls_grads = torch.autograd.grad(
-        loss_cls, parameters, retain_graph=True, allow_unused=True
-    )
-    aux_grads = torch.autograd.grad(
-        loss_aux, parameters, retain_graph=True, allow_unused=True
-    )
-    projected_aux_grads, stats = project_conflicting_gradient(cls_grads, aux_grads)
-    return parameters, aux_grads, projected_aux_grads, stats
-
-
-def projected_encoder_gradients(model, result):
-    """Backward-compatible name for the V1 parameter-space ablation."""
-    return parameter_projected_encoder_gradients(model, result)
-
-
 def representation_projected_gradients(model, result):
     """V2: project gradients at the single shared encoder-output tensor.
 
@@ -220,19 +200,6 @@ def representation_projected_gradients(model, result):
         (cls_grad,), (aux_grad,)
     )
     return representation, aux_grad, projected_aux_grad, stats
-
-
-def replace_encoder_auxiliary_gradient(
-    parameters, raw_aux_grads, projected_aux_grads, aux_weight: float
-):
-    """Replace the unscaled encoder aux component after the normal backward."""
-    with torch.no_grad():
-        for parameter, raw_aux, projected_aux in zip(
-            parameters, raw_aux_grads, projected_aux_grads
-        ):
-            if parameter.grad is None or raw_aux is None or projected_aux is None:
-                continue
-            parameter.grad.add_(projected_aux - raw_aux, alpha=aux_weight)
 
 
 def register_representation_gradient_correction(
@@ -427,21 +394,9 @@ def train_one_experiment(
                                labels=labels, aux_weight=weight)
 
             separate_modes = {"separate", "separate_e2e"}
-            parameter_projection_state = None
             representation_hook = None
             projection_row = None
-            if experiment in PARAMETER_PROJECTED_MODES:
-                parameters, raw_aux_grads, projected_aux_grads, projection_stats = (
-                    parameter_projected_encoder_gradients(model, result)
-                )
-                parameter_projection_state = (
-                    parameters, raw_aux_grads, projected_aux_grads
-                )
-                projection_scope = "transformer_encoder_parameters"
-                projection_vector_numel = sum(
-                    parameter.numel() for parameter in parameters
-                )
-            elif experiment == REPRESENTATION_PROJECTED_MODE:
+            if experiment == REPRESENTATION_PROJECTED_MODE:
                 representation, raw_aux_grad, projected_aux_grad, projection_stats = (
                     representation_projected_gradients(model, result)
                 )
@@ -500,10 +455,6 @@ def train_one_experiment(
                 if representation_hook is not None:
                     representation_hook.remove()
             scaler.unscale_(optimizer)
-            if parameter_projection_state is not None:
-                replace_encoder_auxiliary_gradient(
-                    *parameter_projection_state, aux_weight=weight
-                )
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
             scaler.step(optimizer)
             scaler.update()

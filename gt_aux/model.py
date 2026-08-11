@@ -19,15 +19,7 @@ LOCALIZATION_AUX_WEIGHTS = {
 }
 LOCALIZATION_MODES = {LOCALIZATION_BASELINE_MODE, *LOCALIZATION_AUX_WEIGHTS}
 NO_AUX_MODES = {"baseline", LOCALIZATION_BASELINE_MODE}
-LEGACY_PARAMETER_PROJECTED_MODE = "shared_e2e_projected"
-PARAMETER_PROJECTED_MODE = "shared_e2e_parameter_projected"
 REPRESENTATION_PROJECTED_MODE = "shared_e2e_rep_projected"
-PARAMETER_PROJECTED_MODES = {
-    LEGACY_PARAMETER_PROJECTED_MODE,
-    PARAMETER_PROJECTED_MODE,
-}
-PROJECTED_MODES = {*PARAMETER_PROJECTED_MODES, REPRESENTATION_PROJECTED_MODE}
-# Recommended V2 mode.  Keep the explicit parameter mode as an ablation.
 PROJECTED_MODE = REPRESENTATION_PROJECTED_MODE
 
 
@@ -143,7 +135,7 @@ def assert_hf_bbox_heads_are_tied(detector):
 class GTDeformableDetr(nn.Module):
     VALID_MODES = {
         "baseline", "separate", "separate_e2e", "shared_detach", "shared_e2e",
-        *PROJECTED_MODES,
+        REPRESENTATION_PROJECTED_MODE,
         "shared_decay", "shared_late_decay", "random_patch", "no_adapter",
         *LOCALIZATION_MODES,
     }
