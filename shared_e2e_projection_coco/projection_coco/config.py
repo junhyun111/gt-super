@@ -39,7 +39,7 @@ class TrainConfig:
     gradient_log_every: int = 100
     amp: bool = True
     deterministic: bool = False
-    disable_custom_kernels: bool = True
+    disable_custom_kernels: bool = False
     offline: bool = False
     skip_initial_eval: bool = False
 

@@ -98,7 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--disable-custom-kernels",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Use the portable PyTorch deformable-attention implementation",
     )
     parser.add_argument(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -50,7 +51,12 @@ def initialize_distributed(*, allow_cpu: bool = False) -> DistributedContext:
         )
 
     if world_size > 1:
-        dist.init_process_group(backend=backend, init_method="env://")
+        dist.init_process_group(
+            backend=backend,
+            init_method="env://",
+            timeout=timedelta(hours=6),
+            device_id=device if device.type == "cuda" else None,
+        )
     return DistributedContext(rank, local_rank, world_size, device)
 
 

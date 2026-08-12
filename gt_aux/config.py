@@ -181,7 +181,11 @@ class ExperimentConfig:
 
     def checkpoint_path(self, experiment: str, seed: int | None = None) -> Path:
         seed = self.seed if seed is None else seed
-        group = self.checkpoint_group or experiment
+        # Separate full training from short smoke runs by default.  An
+        # explicit group may still provide a more specific experiment folder.
+        group = self.checkpoint_group or (
+            f"{experiment}_full" if self.run_mode == "full" else experiment
+        )
         model_seed_dir = self.checkpoint_dir / group / f"seed_{seed}"
         model_seed_dir.mkdir(parents=True, exist_ok=True)
         return model_seed_dir / f"checkpoint_{self.run_mode}_{experiment}_seed{seed}.pt"
